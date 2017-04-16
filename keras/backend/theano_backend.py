@@ -27,12 +27,14 @@ py_sum = sum
 theano.config.floatX = _FLOATX
 _LEARNING_PHASE = T.scalar(dtype='uint8', name='keras_learning_phase')  # 0 = test, 1 = train
 _UID_PREFIXES = defaultdict(int)
-
+_DROPOUT_FREEZE = T.scalar(dtype='uint8', name='hh_dropout_freeze')  # 0 = generate new mask, 1 = use old mask
 
 def learning_phase():
     # False = test, True = train
     return _LEARNING_PHASE
 
+def dropout_freeze_shvar():
+    return _DROPOUT_FREEZE
 
 def set_learning_phase(value):
     global _LEARNING_PHASE
@@ -1474,7 +1476,8 @@ def dropout(x, level, noise_shape=None, seed=None):
     if isinstance(noise_shape, list):
         noise_shape = tuple(noise_shape)
 
-    rng = RandomStreams(seed=seed)
+    print('seeeeeed was', seed)
+    rng = RandomStreams(seed)
     retain_prob = 1. - level
 
     if noise_shape is None:
@@ -1487,6 +1490,39 @@ def dropout(x, level, noise_shape=None, seed=None):
     x /= retain_prob
     return x
 
+def dropout_hh(x, level, noise_shape=None, seed=None):
+    """Sets entries in `x` to zero at random,
+    while scaling the entire tensor.
+
+    # Arguments
+        x: tensor
+        level: fraction of the entries in the tensor
+            that will be set to 0.
+        noise_shape: shape for randomly generated keep/drop flags,
+            must be broadcastable to the shape of `x`
+        seed: random seed to ensure determinism.
+    """
+
+    if level < 0. or level >= 1:
+        raise ValueError('Dropout level must be in interval [0, 1[.')
+    if seed is None:
+        seed = np.random.randint(1, 10e6)
+    if isinstance(noise_shape, list):
+        noise_shape = tuple(noise_shape)
+
+    print('seeeeeed was', seed)
+    rng = RandomStreams(seed)
+    retain_prob = 1. - level
+
+    if noise_shape is None:
+        random_tensor = rng.binomial(x.shape, p=retain_prob, dtype=x.dtype)
+    else:
+        random_tensor = rng.binomial(noise_shape, p=retain_prob, dtype=x.dtype)
+        random_tensor = T.patternbroadcast(random_tensor,
+                                           [dim == 1 for dim in noise_shape])
+    x *= random_tensor
+    x /= retain_prob
+    return x, random_tensor
 
 def l2_normalize(x, axis):
     norm = T.sqrt(T.sum(T.square(x), axis=axis, keepdims=True))

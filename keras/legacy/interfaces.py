@@ -589,7 +589,7 @@ def generator_methods_args_preprocessor(args, kwargs):
 
 
 legacy_generator_methods_support = generate_legacy_method_interface(
-    allowed_positional_args=['generator', 'steps_per_epoch', 'epochs'],
+    allowed_positional_args=['opts', 'generator', 'steps_per_epoch', 'epochs'],
     conversions=[('samples_per_epoch', 'steps_per_epoch'),
                  ('val_samples', 'steps'),
                  ('nb_epoch', 'epochs'),

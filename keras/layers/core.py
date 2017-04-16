@@ -8,6 +8,8 @@ import copy
 import inspect
 import types as python_types
 import warnings
+from theano import tensor as T
+from theano.ifelse import ifelse
 
 from .. import backend as K
 from .. import activations
@@ -114,6 +116,86 @@ class Dropout(Layer):
     def get_config(self):
         config = {'rate': self.rate}
         base_config = super(Dropout, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
+class FreezableDropout(Layer):
+    """Applies Dropout to the input.
+
+    Dropout consists in randomly setting
+    a fraction `p` of input units to 0 at each update during training time,
+    which helps prevent overfitting.
+
+    # Arguments
+        p: float between 0 and 1. Fraction of the input units to drop.
+        noise_shape: 1D integer tensor representing the shape of the
+            binary dropout mask that will be multiplied with the input.
+            For instance, if your inputs ahve shape
+            `(batch_size, timesteps, features)` and
+            you want the dropout mask to be the same for all timesteps,
+            you can use `noise_shape=(batch_size, 1, features)`.
+        seed: A Python integer to use as random seed.
+
+    # References
+        - [Dropout: A Simple Way to Prevent Neural Networks from Overfitting](http://www.cs.toronto.edu/~rsalakhu/papers/srivastava14a.pdf)
+    """
+
+    def __init__(self, p, noise_shape=None, seed=None, **kwargs):
+        self.p = p
+        self.noise_shape = noise_shape
+        self.seed = seed
+        if 0. < self.p < 1.:
+            self.uses_learning_phase = True
+        self.supports_masking = True
+        super(FreezableDropout, self).__init__(**kwargs)
+
+    def _get_noise_shape(self, _):
+        return self.noise_shape
+
+    def call(self, x, mask=None):
+        print("x in dropout with p =", self.p, "is", x)
+        #traceback.print_stack()
+        print("#########################################")
+        if 0. < self.p < 1.:
+            noise_shape = self._get_noise_shape(x)
+
+            dropped_inputs0, dropout_mask = K.dropout_hh(x, self.p, noise_shape, seed=self.seed)
+            input_shape = None
+            if hasattr(x, '_keras_shape'):
+                input_shape = x._keras_shape
+            elif hasattr(K, 'int_shape'):
+                input_shape = K.int_shape(x)
+            #print("shape---------------:", input_shape, " +++++ ", type(x), x)
+            self.old_mask = K.ones(input_shape)
+            self.add_update(K.update(self.old_mask, dropout_mask))
+            dropped_inputs1 = x * self.old_mask / (1. - self.p)
+            #dropped_inputs = ifelse(T.eq(K.dropout_freeze_shvar(), 1), dropped_inputs1, dropped_inputs0)
+            dropped_inputs = ifelse(K.dropout_freeze_shvar(), dropped_inputs1, dropped_inputs0)
+            #dropped_inputs = K.dropout(x, self.p, noise_shape, seed=self.seed)
+            x = K.in_train_phase(dropped_inputs, x)
+            #print("x now is", x)
+        #print("fdropout.updates are", self.updates)
+        return x
+
+    def get_config(self):
+        config = {'p': self.p}
+        base_config = super(Dropout, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+class NormalizeLayer(Layer):
+    """Applies Kaldi-style normalization.
+    """
+
+    def __init__(self, target_rms=1.0, **kwargs):
+        super(NormalizeLayer, self).__init__(**kwargs)
+        self.target_rms = target_rms
+
+    def call(self, inputs, training=None):
+        return inputs
+
+    def get_config(self):
+        config = {'target_rms': self.target_rms}
+        base_config = super(NormalizeLayer, self).get_config()
         return dict(list(base_config.items()) + list(config.items()))
 
 

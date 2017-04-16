@@ -987,7 +987,7 @@ class Model(Container):
                 trainable_weights.sort(key=lambda x: x.name)
         self._collected_trainable_weights = trainable_weights
 
-    def _make_train_function(self):
+    def _make_train_function(self, mode=None, alpha=None, epsilon=None):
         if not hasattr(self, 'train_function'):
             raise RuntimeError('You must compile your model before using it.')
         if self.train_function is None:
@@ -995,11 +995,15 @@ class Model(Container):
             if self.uses_learning_phase and not isinstance(K.learning_phase(), int):
                 inputs += [K.learning_phase()]
 
+            inputs += [K.dropout_freeze_shvar()]
             training_updates = self.optimizer.get_updates(
                 self._collected_trainable_weights,
                 self.constraints,
-                self.total_loss)
+                self.total_loss, mode, alpha, epsilon)
             updates = self.updates + training_updates
+
+            #print("self.updates are", self.updates)
+            #print("inputs are", inputs)
             # Gets loss and metrics. Updates weights at each call.
             self.train_function = K.function(inputs,
                                              [self.total_loss] + self.metrics_tensors,
@@ -1013,8 +1017,11 @@ class Model(Container):
             inputs = self._feed_inputs + self._feed_targets + self._feed_sample_weights
             if self.uses_learning_phase and not isinstance(K.learning_phase(), int):
                 inputs += [K.learning_phase()]
+
+            inputs += [K.dropout_freeze_shvar()]
             # Return loss and metrics, no gradient updates.
             # Does update the network states.
+
             self.test_function = K.function(inputs,
                                             [self.total_loss] + self.metrics_tensors,
                                             updates=self.state_updates,
@@ -1036,7 +1043,7 @@ class Model(Container):
                                                updates=self.state_updates,
                                                **kwargs)
 
-    def _fit_loop(self, f, ins, out_labels=None, batch_size=32,
+    def _fit_loop(self, opts, f, f1, f2, ins, out_labels=None, batch_size=32,
                   epochs=100, verbose=1, callbacks=None,
                   val_f=None, val_ins=None, shuffle=True,
                   callback_metrics=None, initial_epoch=0):
@@ -1136,14 +1143,27 @@ class Model(Container):
                 batch_logs = {}
                 batch_logs['batch'] = batch_index
                 batch_logs['size'] = len(batch_ids)
-                callbacks.on_batch_begin(batch_index, batch_logs)
-                outs = f(ins_batch)
-                if not isinstance(outs, list):
-                    outs = [outs]
-                for l, o in zip(out_labels, outs):
-                    batch_logs[l] = o
 
-                callbacks.on_batch_end(batch_index, batch_logs)
+                if len(batch_ids) == 32:
+                    callbacks.on_batch_begin(batch_index, batch_logs)
+                    if batch_index == len(batches) - 2:  # before last batch
+                        befff = batch_logs
+
+                    if opts.bstitch == 0 or batch_index % opts.interval != 0 or epoch < opts.warmup:
+                        outs = f(ins_batch + [0.])
+                    else:
+                        outs = f1(ins_batch + [0.])
+                        f2(ins_batch + [1.])
+
+                    if not isinstance(outs, list):
+                        outs = [outs]
+                    for l, o in zip(out_labels, outs):
+                        batch_logs[l] = o
+
+                    callbacks.on_batch_end(batch_index, batch_logs)
+                    if batch_index == len(batches) - 2:  # before last batch
+                        callbacks.on_batch_begin(batch_index + 1, befff)
+                        callbacks.on_batch_end(batch_index + 1, batch_logs)
 
                 if batch_index == len(batches) - 1:  # last batch
                     # validation
@@ -1247,13 +1267,15 @@ class Model(Container):
         index_array = np.arange(samples)
         for batch_index, (batch_start, batch_end) in enumerate(batches):
             batch_ids = index_array[batch_start:batch_end]
+            if len(batch_ids) != 32:
+                continue
             if isinstance(ins[-1], float):
                 # do not slice the training phase flag
                 ins_batch = _slice_arrays(ins[:-1], batch_ids) + [ins[-1]]
             else:
                 ins_batch = _slice_arrays(ins, batch_ids)
 
-            batch_outs = f(ins_batch)
+            batch_outs = f(ins_batch + [0.])
             if isinstance(batch_outs, list):
                 if batch_index == 0:
                     for batch_out in enumerate(batch_outs):
@@ -1317,7 +1339,7 @@ class Model(Container):
                                  str(x[0].shape[0]) + ' samples')
         return x, y, sample_weights
 
-    def fit(self, x=None,
+    def fit(self, opts, x=None,
             y=None,
             batch_size=32,
             epochs=1,
@@ -1454,8 +1476,30 @@ class Model(Container):
             ins = x + y + sample_weights + [1.]
         else:
             ins = x + y + sample_weights
-        self._make_train_function()
-        f = self.train_function
+
+        if opts.bstitch == 0:  # disabled
+          self._make_train_function()
+          f = self.train_function
+          f1 = None
+          f2 = None
+        elif opts.bstitch == 1:
+          self._make_train_function()
+          f = self.train_function
+          self.train_function = None
+          self._make_train_function(mode="oldbs:step1", alpha=opts.alpha)
+          f1 = self.train_function
+          self.train_function = None
+          self._make_train_function(mode="oldbs:step2", alpha=opts.alpha)
+          f2 = self.train_function
+        elif opts.bstitch == 2:
+          self._make_train_function()
+          f = self.train_function
+          self.train_function = None
+          self._make_train_function(mode="bs:step1", epsilon=opts.epsilon)
+          f1 = self.train_function
+          self.train_function = None
+          self._make_train_function(mode="bs:step2", alpha=opts.alpha, epsilon=opts.epsilon)
+          f2 = self.train_function
 
         # prepare display labels
         out_labels = self.metrics_names
@@ -1477,7 +1521,7 @@ class Model(Container):
             callback_metrics = copy.copy(out_labels)
 
         # delegate logic to _fit_loop
-        return self._fit_loop(f, ins, out_labels=out_labels,
+        return self._fit_loop(opts, f, f1, f2, ins, out_labels=out_labels,
                               batch_size=batch_size, epochs=epochs,
                               verbose=verbose, callbacks=callbacks,
                               val_f=val_f, val_ins=val_ins, shuffle=shuffle,
@@ -1571,7 +1615,7 @@ class Model(Container):
         return self._predict_loop(f, ins,
                                   batch_size=batch_size, verbose=verbose)
 
-    def train_on_batch(self, x, y,
+    def train_on_batch(self, opts, x, y, batch_index=None, epoch=None,
                        sample_weight=None, class_weight=None):
         """Runs a single gradient update on a single batch of data.
 
@@ -1617,7 +1661,12 @@ class Model(Container):
         else:
             ins = x + y + sample_weights
         self._make_train_function()
-        outputs = self.train_function(ins)
+        #outputs = self.train_function(ins)
+        if opts.bstitch == 0 or batch_index % opts.interval != 0 or epoch < opts.warmup:
+            outputs = self.f(ins + [0.])
+        else:
+            outputs = self.f1(ins + [0.])
+            self.f2(ins + [1.])
         if len(outputs) == 1:
             return outputs[0]
         return outputs
@@ -1686,7 +1735,7 @@ class Model(Container):
         return outputs
 
     @interfaces.legacy_generator_methods_support
-    def fit_generator(self, generator,
+    def fit_generator(self, opts, generator,
                       steps_per_epoch,
                       epochs=1,
                       verbose=1,
@@ -1767,6 +1816,30 @@ class Model(Container):
             ValueError: In case the generator yields
                 data in an invalid format.
         """
+        if opts.bstitch == 0:  # disabled
+          self._make_train_function()
+          self.f = self.train_function
+          self.f1 = None
+          self.f2 = None
+        elif opts.bstitch == 1:
+          self._make_train_function()
+          self.f = self.train_function
+          self.train_function = None
+          self._make_train_function(mode="oldbs:step1", alpha=opts.alpha)
+          self.f1 = self.train_function
+          self.train_function = None
+          self._make_train_function(mode="oldbs:step2", alpha=opts.alpha)
+          self.f2 = self.train_function
+        elif opts.bstitch == 2:
+          self._make_train_function()
+          self.f = self.train_function
+          self.train_function = None
+          self._make_train_function(mode="bs:step1", epsilon=opts.epsilon)
+          self.f1 = self.train_function
+          self.train_function = None
+          self._make_train_function(mode="bs:step2", alpha=opts.alpha, epsilon=opts.epsilon)
+          self.f2 = self.train_function
+
         wait_time = 0.01  # in seconds
         epoch = initial_epoch
 
@@ -1831,6 +1904,7 @@ class Model(Container):
             enqueuer.start(max_q_size=max_q_size, workers=workers)
 
             callback_model.stop_training = False
+            some_out = None  # used for batches with sizes different from 32 -- used to fool Keras that all batches have been processed
             while epoch < epochs:
                 callbacks.on_epoch_begin(epoch)
                 steps_done = 0
@@ -1869,18 +1943,23 @@ class Model(Container):
                         batch_size = x.shape[0]
                     batch_logs['batch'] = batch_index
                     batch_logs['size'] = batch_size
-                    callbacks.on_batch_begin(batch_index, batch_logs)
 
-                    outs = self.train_on_batch(x, y,
+                    if batch_size == 32:
+                        callbacks.on_batch_begin(batch_index, batch_logs)
+                        outs = self.train_on_batch(opts, x, y, batch_index=batch_index, epoch=epoch,
                                                sample_weight=sample_weight,
                                                class_weight=class_weight)
 
-                    if not isinstance(outs, list):
-                        outs = [outs]
-                    for l, o in zip(out_labels, outs):
-                        batch_logs[l] = o
-
-                    callbacks.on_batch_end(batch_index, batch_logs)
+                        if not isinstance(outs, list):
+                            outs = [outs]
+                        for l, o in zip(out_labels, outs):
+                            batch_logs[l] = o
+                        if some_out is None:
+                            some_out = copy.deepcopy(batch_logs)
+                        callbacks.on_batch_end(batch_index, batch_logs)
+                    else:
+                        callbacks.on_batch_begin(batch_index, batch_logs)
+                        callbacks.on_batch_end(batch_index, some_out)
 
                     # Construct epoch logs.
                     epoch_logs = {}

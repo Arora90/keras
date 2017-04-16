@@ -31,7 +31,7 @@ class Optimizer(object):
     """
 
     def __init__(self, **kwargs):
-        allowed_kwargs = {'clipnorm', 'clipvalue'}
+        allowed_kwargs = {'clipnorm', 'clipvalue', 'iters_per_epoch'}
         for k in kwargs:
             if k not in allowed_kwargs:
                 raise TypeError('Unexpected keyword argument '
@@ -115,32 +115,93 @@ class SGD(Optimizer):
     """
 
     def __init__(self, lr=0.01, momentum=0., decay=0.,
-                 nesterov=False, **kwargs):
+                 nesterov=False, decay_type='step', decay_step=None, **kwargs):
         super(SGD, self).__init__(**kwargs)
-        self.iterations = K.variable(0., name='iterations')
-        self.lr = K.variable(lr, name='lr')
-        self.momentum = K.variable(momentum, name='momentum')
-        self.decay = K.variable(decay, name='decay')
+        self.iterations = K.variable(0.)
+        self.lr = K.variable(lr)
+        self.momentum = K.variable(momentum)
+        self.decay = K.variable(decay)
         self.initial_decay = decay
         self.nesterov = nesterov
+        self.decay_type = decay_type
+        self.decay_step = decay_step
 
-    def get_updates(self, params, constraints, loss):
-        grads = self.get_gradients(loss, params)
+    def get_updates(self, params, constraints, loss, mode=None, alpha=None, epsilon=None):
         self.updates = []
+        if mode == None or mode == "nobs":
+          mode = "nobs"
+          assert alpha is None and epsilon is None, "alpha and epsilon must be None in nobs mode"
+        elif mode == "bs:step1":
+          assert epsilon is not None and alpha is None, "bs:step1 params error"
+          assert epsilon > 0, "epsilon must be >0 in bs:step1"
+        elif mode == "bs:step2":
+          assert epsilon > 0 and alpha >= epsilon, "bs:step2 params error"
+        elif mode == "oldbs:step1":
+          assert epsilon is None and alpha is not None, "oldbs:step1 params error"
+          assert alpha > 0, "alpha must be >0 in oldbs:step1"
+        elif mode == "oldbs:step2":
+          assert epsilon is None and alpha > 0, "oldbs:step2 params error"
+        else:
+          assert False, "Mode %s not recognized." % mode
+        print("mode:", mode)
 
-        lr = self.lr
-        if self.initial_decay > 0:
-            lr *= (1. / (1. + self.decay * self.iterations))
-            self.updates .append(K.update_add(self.iterations, 1))
+        # we want to add iterations once for each backstitch step
+        if mode == "nobs" or mode == "bs:step2" or mode == "oldbs:step2":
+          self.updates.append(K.update_add(self.iterations, 1))
 
-        # momentum
+        epoch = self.iterations / self.iters_per_epoch
+
+        if self.decay_type == 'default':
+            lr = self.lr
+            if self.initial_decay > 0:
+                lr *= (1. / (1. + self.decay * self.iterations))
+        elif self.decay_type == 'step':
+            #lr1 = ifelse(T.gt(epoch, 100), self.lr * 0.1, self.lr)
+            #lr2 = ifelse(T.gt(epoch, 150), lr1 * 0.1, lr1)
+            #lr = ifelse(T.gt(epoch, 200), lr2 * 0.1, lr2)
+            lr = self.lr * (self.decay_step[1] ** (epoch // self.decay_step[0]))
+        else:
+            assert False, "Fataaaal: decay type not recognized."
+
+
+        # momentum  -->  not supported yet --> should be 0.0 when backstitch is enabled
         shapes = [K.get_variable_shape(p) for p in params]
         moments = [K.zeros(shape) for shape in shapes]
-        self.weights = [self.iterations] + moments
-        for p, g, m in zip(params, grads, moments):
-            v = self.momentum * m - lr * g  # velocity
-            self.updates.append(K.update(m, v))
+        if mode == "bs:step1" or mode == "nobs" or mode == "oldbs:step1": # first step in backstitching
+          self.old_grads = [K.zeros(shape) for shape in shapes]
 
+        if mode == "bs:step2":
+            grads0 = K.gradients(loss, params)
+            alpha_hat = alpha * alpha + alpha
+            grads = [(alpha_hat - epsilon - epsilon*epsilon) / alpha_hat * o - g for g, o in zip(grads0, self.old_grads)]
+            if hasattr(self, 'clipnorm') and self.clipnorm > 0:
+                norm = K.sqrt(sum([K.sum(K.square(g)) for g in grads]))
+                grads = [clip_norm(g, self.clipnorm * (1+epsilon) * epsilon / alpha_hat, norm) for g in grads]
+        else:  ## apply max-change as regular
+            grads = self.get_gradients(loss, params)
+
+
+        ### the following line is not really important ###
+        self.weights = [self.iterations] + moments
+
+        for p, g, m, o in zip(params, grads, moments, self.old_grads):
+            if mode == "bs:step1":
+              v = epsilon * lr * g  # the epsilon move
+              #self.updates.append(K.update(o, lr * g))
+              self.updates.append(K.update(o, g))
+            elif mode == "nobs":
+              v = self.momentum * m - lr * g  # velocity
+              self.updates.append(K.update(m, v))
+            elif mode == "bs:step2":
+              #alpha_hat = alpha * alpha + alpha
+              #v = alpha_hat/epsilon * ((alpha_hat - epsilon - epsilon*epsilon) / alpha_hat * o - lr * g)
+              v = alpha_hat/epsilon * lr * g
+            elif mode == "oldbs:step1":
+              v = alpha * lr * g  # the backward move
+            elif mode == "oldbs:step2":
+              v = -(1.0 + alpha) * lr * g
+
+            ## not supported  -->  should be disabled when backstitch is enabled ##
             if self.nesterov:
                 new_p = p + self.momentum * v - lr * g
             else:
@@ -153,6 +214,7 @@ class SGD(Optimizer):
 
             self.updates.append(K.update(p, new_p))
         return self.updates
+
 
     def get_config(self):
         config = {'lr': float(K.get_value(self.lr)),

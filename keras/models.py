@@ -772,7 +772,7 @@ class Sequential(Model):
         self.metrics_names = self.model.metrics_names
         self.sample_weight_mode = self.model.sample_weight_mode
 
-    def fit(self, x, y, batch_size=32, epochs=10, verbose=1, callbacks=None,
+    def fit(self, opts, x, y, batch_size=32, epochs=10, verbose=1, callbacks=None,
             validation_split=0., validation_data=None, shuffle=True,
             class_weight=None, sample_weight=None, initial_epoch=0, **kwargs):
         """Trains the model for a fixed number of epochs.
@@ -832,7 +832,7 @@ class Sequential(Model):
         if self.model is None:
             raise RuntimeError('The model needs to be compiled '
                                'before being used.')
-        return self.model.fit(x, y,
+        return self.model.fit(opts, x, y,
                               batch_size=batch_size,
                               epochs=epochs,
                               verbose=verbose,
@@ -1000,7 +1000,7 @@ class Sequential(Model):
             return (proba > 0.5).astype('int32')
 
     @interfaces.legacy_generator_methods_support
-    def fit_generator(self, generator,
+    def fit_generator(self, opts, generator,
                       steps_per_epoch,
                       epochs=1,
                       verbose=1,
@@ -1083,7 +1083,7 @@ class Sequential(Model):
         if self.model is None:
             raise RuntimeError('The model needs to be compiled '
                                'before being used.')
-        return self.model.fit_generator(generator,
+        return self.model.fit_generator(opts, generator,
                                         steps_per_epoch,
                                         epochs,
                                         verbose=verbose,
